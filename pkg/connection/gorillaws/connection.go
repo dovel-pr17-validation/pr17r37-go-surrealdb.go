@@ -1,0 +1,769 @@
+package gorillaws
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net"
+	"net/http"
+	"os"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/fxamacker/cbor/v2"
+	"github.com/surrealdb/surrealdb.go/v2/internal/codec"
+
+	"github.com/surrealdb/surrealdb.go/v2/internal/rand"
+	"github.com/surrealdb/surrealdb.go/v2/internal/wsutil"
+	"github.com/surrealdb/surrealdb.go/v2/pkg/connection"
+	"github.com/surrealdb/surrealdb.go/v2/pkg/connection/rpc"
+	"github.com/surrealdb/surrealdb.go/v2/pkg/constants"
+	"github.com/surrealdb/surrealdb.go/v2/pkg/logger"
+
+	gorilla "github.com/gorilla/websocket"
+)
+
+// closeMessageTimeout bounds the write of the close message when Close is
+// given a context without a deadline.
+const closeMessageTimeout = time.Second
+
+// DefaultDialer is the default gorilla dialer used by the WebSocketConnection
+//
+// It uses the default gorilla dialer as of gorilla/websocket v1.5.0 with the following modifications:
+// - EnableCompression is set to true
+// - Subprotocols is set to ["cbor"]
+//
+// Connect does not use the Subprotocols of DefaultDialer: it offers "cbor.2"
+// and "cbor" when the codec speaks cbor.2 (see [connection.CBORVersion]),
+// else "cbor".
+var DefaultDialer = &gorilla.Dialer{
+	Proxy:             gorilla.DefaultDialer.Proxy,
+	HandshakeTimeout:  gorilla.DefaultDialer.HandshakeTimeout,
+	EnableCompression: true,
+	Subprotocols:      []string{"cbor"},
+}
+
+type Option func(ws *Connection) error
+
+type Connection struct {
+	connection.Toolkit
+
+	Conn *gorilla.Conn
+	// connLock guards Conn, which Connect sets and Close clears. It is held
+	// only to read or change Conn, never across a write.
+	connLock sync.Mutex
+	// writeLock lets one request at a time be written, for no longer than
+	// its context allows.
+	writeLock wsutil.WriteLock
+
+	// Timeout is the timeout for receiveing the RPC response after
+	// you've successfully sent the request.
+	//
+	// If the timeout is reached, the Send method will return ErrTimeout.
+	// You can set it to 0 to disable the timeout, and instead use context.Context and context.WithTimeout
+	// to control the timeout. It will be useful if you want to avoid the overhead of wrapping the context
+	// with a timeout.
+	Timeout time.Duration
+
+	Option []Option
+	logger logger.Logger
+
+	// connCloseCh signals that the connection is being closed.
+	// It is used to stop the readLoop goroutine and prevent Send from writing to a closed (i.e. nil) connection.
+	connCloseCh chan struct{}
+
+	// connCloseError stores the error that caused the connection to close.
+	// Protected by closeMutex for thread-safe access.
+	connCloseError error
+
+	// closeMutex protects access to connCloseError
+	closeMutex sync.RWMutex
+
+	// closed is used to indicate whether the connection is closed.
+	// It is set to true when the connection is closed, and false otherwise.
+	// Once this is set to true, it cannot be set to false again.
+	//
+	// To reconnect, you should create a new instance of Connection
+	// and call Connect on it.
+	//
+	// This field is accessed using atomic operations to prevent data races.
+	closed atomic.Bool
+
+	// done is closed with the connection, unlike connCloseCh which exists
+	// only once connected.
+	done chan struct{}
+}
+
+var (
+	_ connection.CloseNotifier = (*Connection)(nil)
+	_ connection.Redialer      = (*Connection)(nil)
+)
+
+func New(p *connection.Config) *Connection {
+	return &Connection{
+		Toolkit: connection.Toolkit{
+			BaseURL: p.BaseURL,
+
+			Marshaler:     p.Marshaler,
+			Unmarshaler:   p.Unmarshaler,
+			DisableCBORv2: p.DisableCBORv2,
+
+			ResponseChannels:     make(map[string]chan connection.RPCResponse[cbor.RawMessage]),
+			NotificationChannels: make(map[string]chan connection.Notification),
+		},
+		Timeout: constants.DefaultWSTimeout,
+		logger:  logger.New(slog.NewJSONHandler(os.Stdout, nil)),
+		done:    make(chan struct{}),
+	}
+}
+
+// Redial returns a new connection to the same server, with the same
+// configuration, for reconnecting after this one is lost.
+func (c *Connection) Redial() connection.Connection {
+	return &Connection{
+		Toolkit: connection.Toolkit{
+			BaseURL:       c.BaseURL,
+			Marshaler:     c.Marshaler,
+			Unmarshaler:   c.Unmarshaler,
+			DisableCBORv2: c.DisableCBORv2,
+			Logger:        c.Toolkit.Logger,
+
+			ResponseChannels:     make(map[string]chan connection.RPCResponse[cbor.RawMessage]),
+			NotificationChannels: make(map[string]chan connection.Notification),
+		},
+		Timeout: c.Timeout,
+		Option:  c.Option,
+		logger:  c.logger,
+		done:    make(chan struct{}),
+	}
+}
+
+// Closed returns a channel which is closed when the connection closes.
+func (c *Connection) Closed() <-chan struct{} {
+	return c.done
+}
+
+// CloseError returns why the connection closed: nil after Close.
+func (c *Connection) CloseError() error {
+	c.closeMutex.RLock()
+	defer c.closeMutex.RUnlock()
+	return c.connCloseError
+}
+
+// closedError is the error for a request on a closed connection.
+func (c *Connection) closedError() error {
+	if err := c.CloseError(); err != nil {
+		return fmt.Errorf("%w: %w", connection.ErrConnectionClosed, err)
+	}
+	return connection.ErrConnectionClosed
+}
+
+// IsClosed checks if the WebSocket connection is disconnected.
+// This is useful to enable the consumer of WebSocketConnection
+// to trigger reconnection attempts if the connection is disconnected unexpectedly.
+func (c *Connection) IsClosed() bool {
+	return c.closed.Load()
+}
+
+// Connect establishes the WebSocket connection to the SurrealDB server.
+// This method must be called from tryConnecting to prevent
+// multiple goroutines from trying to connect at the same time.
+func (c *Connection) Connect(ctx context.Context) error {
+	dialer := *DefaultDialer
+	dialer.Subprotocols = c.CBORSubprotocols()
+	conn, res, err := dialer.DialContext(ctx, fmt.Sprintf("%s/rpc", c.BaseURL), nil)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+
+	// Delaying the lock until this point reduces
+	// the max time Send is blocked on the connLock negligible.
+	c.connLock.Lock()
+	defer c.connLock.Unlock()
+
+	c.UseCBORSubprotocol(conn.Subprotocol())
+	c.Conn = conn
+
+	for _, option := range c.Option {
+		if err := option(c); err != nil {
+			return err
+		}
+	}
+
+	c.connCloseCh = make(chan struct{})
+
+	// Start a goroutine to read messages from the WebSocket connection.
+	// This will run in the background and handle incoming messages,
+	// until closeChan is closed, or a read error indicating
+	// lost connection occurs.
+	go c.readLoop(conn)
+
+	return nil
+}
+
+func (c *Connection) SetTimeOut(timeout time.Duration) *Connection {
+	c.Option = append(c.Option, func(ws *Connection) error {
+		ws.Timeout = timeout
+		return nil
+	})
+	return c
+}
+
+// If path is empty it will use os.stdout/os.stderr
+func (c *Connection) Logger(logData logger.Logger) *Connection {
+	c.logger = logData
+	return c
+}
+
+func (c *Connection) RawLogger(logData logger.Logger) *Connection {
+	c.logger = logData
+	return c
+}
+
+func (c *Connection) SetCompression(compress bool) *Connection {
+	c.Option = append(c.Option, func(ws *Connection) error {
+		ws.Conn.EnableWriteCompression(compress)
+		return nil
+	})
+	return c
+}
+
+// Close closes the WebSocket connection and stops listening for incoming messages.
+//
+// The context parameter allows the caller to cancel the close operation if it takes too long.
+// This is useful when the underlying network connection is unreliable.
+// If the context is canceled, the connection will still be closed in the background.
+//
+// If you want to make the close operation free of resource-leak as much as possible,
+// you should provide a context with a timeout/deadline.
+//
+// We then propagate the deadline to the WebSocket close message write operation,
+// which enables us to clean up everything including the internal goroutine that used to
+// try writing to the WebSocket connection, when this function exists.
+func (c *Connection) Close(ctx context.Context) error {
+	// No more notifications will come: end every live query's notifications
+	// and stop their goroutines, including those still delivering what was
+	// received before the connection was lost.
+	defer c.CloseAllLiveNotifications()
+
+	if c.IsClosed() {
+		return nil
+	}
+
+	// Signal that we're closing so that the goroutine reading from the connection
+	// can stop reading messages and exit.
+	//
+	// TODO: This might not be necessary, because the gorilla.Conn.Close() method
+	// will close the connection and that would result in the ReadMessage call in
+	// ws.initialize() goroutine to return an error, which will stop the goroutine.
+	//
+	// This is to prevent concurrent Send fail before trying to lock connLock
+	// and try writing a message.
+	//
+	// This also serves as a guardrail to prevent Send proceeding to write to nil ws.Conn
+	c.closeWithError(nil)
+
+	// We defer locking connLock until this point and do state check
+	// to prevent Close blocking on repeated Close calls.
+	c.connLock.Lock()
+	defer c.connLock.Unlock()
+
+	conn := c.Conn
+	c.Conn = nil
+
+	// Phase 1: Try to send the close message
+	//
+	// We assume this is important to let the server know that we're closing the connection.
+	// If the write fails, we still try to close the connection locally,
+	// so that we don't leak resources locally.
+
+	writeErr := make(chan error, 1)
+
+	go func() {
+		// WriteControl may run while a request is being written, and gives up
+		// at its deadline, as when that write is stuck: closing the network
+		// connection below then stops that write too.
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			deadline = time.Now().Add(closeMessageTimeout)
+		}
+		err := conn.WriteControl(gorilla.CloseMessage, gorilla.FormatCloseMessage(constants.CloseMessageCode, ""), deadline)
+
+		// Try to send the error, but also check if we should abandon the attempt
+		select {
+		case writeErr <- err:
+		case <-ctx.Done():
+			// TODO: This may not be absolutely necessary,
+			// because WriteMessage would fail after we call ws.Conn.Close().
+			// For now, it's here to be extra cautious and to ensure we don't leave the goroutine hanging.
+		}
+	}()
+
+	select {
+	case err := <-writeErr:
+		if err != nil {
+			// Write failed, but we don't return here,
+			// because we try our best to Close the connection anyway,
+			// although it might not be a clean close from the server's perspective.
+			c.logger.Error("failed to write close message", "error", err)
+		}
+	case <-ctx.Done():
+		// Again, we don't return here, because we try our best to Close the connection anyway,
+		// although it might not be a clean close from the server's perspective.
+	}
+
+	// Phase 2: Close the underlying connection.
+	//
+	// We assume the Close method of the gorilla.Conn is an instantaneous operation,
+	// so we don't need to consider the context here, even
+	// in case the context is already canceled.
+	//
+	// We do this regardless of whether the write of the close message succeeded or not,
+	// because we want to ensure the local resources are cleaned up anyway.
+	// The lack of a close message write might result in the server not knowing
+	// that the client is closing the connection in a timely manner,
+	// we can't do much about it given we already failed to write it.
+
+	return conn.Close()
+}
+
+func (c *Connection) Use(ctx context.Context, namespace, database string) error {
+	return connection.Send[any](c, ctx, nil, "use", namespace, database)
+}
+
+func (c *Connection) Let(ctx context.Context, key string, value any) error {
+	return connection.Send[any](c, ctx, nil, "let", key, value)
+}
+
+func (c *Connection) Authenticate(ctx context.Context, token string) error {
+	return rpc.Authenticate(c, ctx, token)
+}
+
+func (c *Connection) SignUp(ctx context.Context, authData any) (string, error) {
+	return rpc.SignUp(c, ctx, authData)
+}
+
+func (c *Connection) SignIn(ctx context.Context, authData any) (string, error) {
+	return rpc.SignIn(c, ctx, authData)
+}
+
+func (c *Connection) SignUpWithRefresh(ctx context.Context, authData any) (*connection.Tokens, error) {
+	return rpc.SignUpWithRefresh(c, ctx, authData)
+}
+
+func (c *Connection) SignInWithRefresh(ctx context.Context, authData any) (*connection.Tokens, error) {
+	return rpc.SignInWithRefresh(c, ctx, authData)
+}
+
+func (c *Connection) Invalidate(ctx context.Context) error {
+	return rpc.Invalidate(c, ctx)
+}
+
+func (c *Connection) Unset(ctx context.Context, key string) error {
+	return connection.Send[any](c, ctx, nil, "unset", key)
+}
+
+// HTTPEndpoint returns the server's base URL and the HTTP client to reach it
+// with, which connects as [DefaultDialer] does. The client has no timeout of
+// its own, as a bulk transfer may take long; the request's context bounds it.
+func (c *Connection) HTTPEndpoint() (baseURL string, client *http.Client) {
+	return c.BaseURL, httpClientFor(DefaultDialer, 0)
+}
+
+// Health asks the server whether it is healthy, with GET /health over HTTP.
+// The request reaches the server as the WebSocket does, through the proxy,
+// TLS configuration and dialers of [DefaultDialer].
+func (c *Connection) Health(ctx context.Context) error {
+	return connection.CheckHealth(ctx, httpClientFor(DefaultDialer, connection.DefaultHealthClient.Timeout), c.BaseURL)
+}
+
+// baseTransport returns a copy of http.DefaultTransport, or a transport with
+// the same settings when an application has replaced it with another kind of
+// RoundTripper.
+func baseTransport() *http.Transport {
+	if t, ok := http.DefaultTransport.(*http.Transport); ok {
+		return t.Clone()
+	}
+	return &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: time.Second,
+	}
+}
+
+// httpClientFor returns an HTTP client which connects as a WebSocket dialer
+// does, with the given timeout, or none if it is 0. It keeps no idle
+// connections, as it is made for one request.
+func httpClientFor(d *gorilla.Dialer, timeout time.Duration) *http.Client {
+	t := baseTransport()
+	t.DisableKeepAlives = true
+	t.Proxy = d.Proxy
+	// The dialer's TLS configuration, or none, replaces any the default
+	// transport was given, which the WebSocket does not use either.
+	t.TLSClientConfig = d.TLSClientConfig.Clone()
+	// So do its dial hooks: without any, it dials with a plain net.Dialer,
+	// not with hooks an application gave the default transport.
+	t.DialContext = nil
+	t.DialTLSContext = nil
+	t.Dial = nil    //nolint:staticcheck // a deprecated hook is still used if set
+	t.DialTLS = nil //nolint:staticcheck // a deprecated hook is still used if set
+	switch {
+	case d.NetDialContext != nil:
+		t.DialContext = d.NetDialContext
+	case d.NetDial != nil:
+		netDial := d.NetDial
+		t.DialContext = func(_ context.Context, network, addr string) (net.Conn, error) {
+			return netDial(network, addr)
+		}
+	}
+	if d.NetDialTLSContext != nil {
+		t.DialTLSContext = d.NetDialTLSContext
+	}
+	// Cookies the WebSocket handshake sends, such as a proxy's session, go
+	// with these requests too.
+	return &http.Client{Transport: t, Timeout: timeout, Jar: d.Jar}
+}
+
+func (c *Connection) GetUnmarshaler() codec.Unmarshaler {
+	return c.Unmarshaler
+}
+
+// GetMarshaler returns the marshaler the connection encodes requests with.
+func (c *Connection) GetMarshaler() codec.Marshaler {
+	return c.Marshaler
+}
+
+// Send sends a request to SurrealDB and expects a response.
+//
+// The `ctx` is wrapped with a timeout if `ws.Timeout` is set.
+// If you want to avoid this, for eliminating the overhead of wrapping the context,
+// you can set `ws.Timeout` to 0.
+//
+// CAUTION: Although this function returns ErrTimeout in case the timeout is reached now,
+// it will instead return context.DeadlineExceeded in upcoming versions of this SDK.
+//
+// The rationale is that it resulted in two different implementations of the Connection interface,
+// HTTP and WebSocket, to behave differently in case of a timeout.
+// The WebSocketConnection would return ErrTimeout, while the HTTPConnection would return context.DeadlineExceeded.
+func (c *Connection) Send(ctx context.Context, method string, params ...any) (*connection.RPCResponse[cbor.RawMessage], error) {
+	request := &connection.RPCRequest{
+		Method: method,
+		Params: params,
+	}
+	return c.Call(ctx, request)
+}
+
+// Call sends a custom RPC request to SurrealDB and expects a response.
+// Unlike Send, Call accepts an RPCRequest directly, allowing you to set
+// Session and Txn fields for session-scoped or transaction-scoped operations.
+func (c *Connection) Call(ctx context.Context, req *connection.RPCRequest) (*connection.RPCResponse[cbor.RawMessage], error) {
+	if c.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, c.Timeout)
+		defer cancel()
+	}
+
+	select {
+	case <-c.done:
+		return nil, c.closedError()
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+
+	// Set request ID if not already set
+	id := req.ID
+	if id == nil || id == "" {
+		id = rand.NewRequestID(constants.RequestIDLength)
+		req.ID = id
+	}
+
+	responseChan, err := c.CreateResponseChannel(fmt.Sprintf("%v", id))
+	if err != nil {
+		return nil, err
+	}
+	defer c.RemoveResponseChannel(fmt.Sprintf("%v", id))
+
+	if err := c.write(ctx, req); err != nil {
+		return nil, err
+	}
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-c.done:
+		return nil, c.closedError()
+	case res, open := <-responseChan:
+		if !open {
+			return nil, errors.New("response channel closed")
+		}
+
+		if res.Error != nil {
+			return nil, res.Error
+		}
+		return &res, nil
+	}
+}
+
+// CallStream sends a request answered by many responses, such as
+// query_stream, and returns the stream they arrive on.
+func (c *Connection) CallStream(ctx context.Context, req *connection.RPCRequest) (*connection.ResponseStream, error) {
+	select {
+	case <-c.connCloseCh:
+		return nil, c.closeErr()
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+
+	if req.ID == nil || req.ID == "" {
+		req.ID = rand.NewRequestID(constants.RequestIDLength)
+	}
+
+	stream, err := c.OpenResponseStream(fmt.Sprintf("%v", req.ID), c.connCloseCh, c.closeErr)
+	if err != nil {
+		return nil, err
+	}
+	stream.FirstResponseTimeout = c.Timeout
+	if err := c.write(ctx, req); err != nil {
+		stream.Close()
+		return nil, err
+	}
+	return stream, nil
+}
+
+// closeErr is the error for a request on the closed connection: never nil,
+// even after a clean Close.
+func (c *Connection) closeErr() error {
+	c.closeMutex.RLock()
+	defer c.closeMutex.RUnlock()
+	return connection.ClosedError(c.connCloseError)
+}
+
+// write sends v as one message. It waits for the writes before it only as
+// long as ctx allows, so that a write which the server or the network stops
+// taking holds up neither the requests after it nor Close.
+//
+// The write itself is not stopped when ctx ends: gorilla cannot write to a
+// connection again after a write fails, so stopping it would close the
+// connection for every request on it. It is bounded by Timeout instead, as a
+// write which takes longer means the other end has stopped reading, and the
+// connection is closed then.
+func (c *Connection) write(ctx context.Context, v any) error {
+	data, err := c.Marshaler.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	if lockErr := c.writeLock.Lock(ctx); lockErr != nil {
+		return lockErr
+	}
+	defer c.writeLock.Unlock()
+
+	c.connLock.Lock()
+	conn := c.Conn
+	c.connLock.Unlock()
+	if conn == nil {
+		return errors.New("connection is closed")
+	}
+
+	var deadline time.Time
+	if c.Timeout > 0 {
+		deadline = time.Now().Add(c.Timeout)
+	}
+	if deadlineErr := conn.SetWriteDeadline(deadline); deadlineErr != nil {
+		return deadlineErr
+	}
+	err = conn.WriteMessage(gorilla.BinaryMessage, data)
+
+	switch {
+	case err == nil:
+		return nil
+	case wsutil.IsTimeout(err) && !deadline.IsZero() && !time.Now().Before(deadline):
+		if c.closeWithError(fmt.Errorf("a request could not be written within %v: %w", c.Timeout, err)) {
+			_ = conn.Close()
+		}
+		return fmt.Errorf("writing the request: %w", context.DeadlineExceeded)
+	case c.IsClosed():
+		// Closed meanwhile, as by Close, which stops a write under way.
+		return c.closedError()
+	case errors.Is(err, gorilla.ErrCloseSent):
+		// Transition to disconnected state so IsClosed() returns true
+		// This allows rews to detect the closed connection and reconnect
+		c.closeWithError(err)
+	}
+	return err
+}
+
+// closeWithError marks the connection closed with err, and reports whether
+// this call was the one which did.
+func (c *Connection) closeWithError(err error) bool {
+	// Use CompareAndSwap to atomically check and set closed flag
+	// This ensures only one goroutine can proceed to close the channel
+	if !c.closed.CompareAndSwap(false, true) {
+		// Already closed by another goroutine
+		return false
+	}
+
+	c.closeMutex.Lock()
+	c.connCloseError = err
+	c.closeMutex.Unlock()
+
+	// At this point, we know we're the only goroutine that will close the channel
+	// because we successfully set closed from 0 to 1
+	if c.connCloseCh != nil {
+		close(c.connCloseCh)
+	}
+	if c.done != nil {
+		close(c.done)
+	}
+
+	// The connection was lost: no more notifications will come, but those
+	// already received are still delivered before each live query's channel
+	// is closed. Close stops that. (A nil err means Close is closing it.)
+	if err != nil {
+		c.DrainAllLiveNotifications()
+	}
+	return true
+}
+
+func (c *Connection) readLoop(conn *gorilla.Conn) {
+	for {
+		select {
+		case <-c.connCloseCh:
+			return
+		default:
+			_, data, err := conn.ReadMessage()
+			if err != nil {
+				shouldExit := c.handleError(err)
+				if shouldExit {
+					// Close returns at once for a connection already marked
+					// closed, so release the network connection here, unless
+					// Close marked it and closes it itself: closing it here too
+					// would make Close fail with net.ErrClosed.
+					if c.closeWithError(err) {
+						_ = conn.Close()
+					}
+					return
+				}
+				continue
+			}
+			// Handled in order, on this goroutine: delivery never blocks, and
+			// a goroutine per message would reorder live notifications and
+			// the frames of a streamed answer.
+			c.handleResponse(data)
+		}
+	}
+}
+
+// handleError returns true if the error indicates that the connection is closed
+// and the readLoop should exit, false otherwise. The readLoop then closes the
+// connection with the error, unless Close did so first.
+func (c *Connection) handleError(err error) bool {
+	if errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	if gorilla.IsUnexpectedCloseError(err) {
+		// The server closed the connection, or it was lost without a close
+		// frame. Return at once, so that readLoop marks the connection closed:
+		// waiting for Close here left IsClosed false, so it was never
+		// reconnected, and live queries never learned the connection had gone.
+		return true
+	}
+
+	// Handle timeout and network errors to prevent readLoop from
+	// retrying on a dead connection, which can cause panics.
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+
+	c.logger.Error(err.Error())
+	return false
+}
+
+func (c *Connection) handleResponse(res []byte) {
+	var rpcRes connection.RPCResponse[cbor.RawMessage]
+	if err := c.Unmarshaler.Unmarshal(res, &rpcRes); err != nil {
+		// Log the error and return to prevent:
+		// 1. DoS attacks from malformed CBOR data causing panics
+		// 2. Memory exhaustion from unmarshaling large malformed data
+		c.logger.Error(
+			"Failed to unmarshal response",
+			"error", err,
+		)
+		return
+	}
+
+	if rpcRes.ID != nil && rpcRes.ID != "" {
+		// Try to resolve message as response to query
+		if !c.DeliverResponse(fmt.Sprintf("%v", rpcRes.ID), rpcRes) {
+			err := fmt.Errorf("unavailable ResponseChannel %+v", rpcRes.ID)
+			c.logger.Error(err.Error())
+		}
+	} else if rpcRes.Result == nil && rpcRes.Error != nil {
+		// Some error cases result in the lack of an ID field in the response,
+		// so we handle the error here,
+		// rather than unintentionally treating it as a notification.
+		// See https://github.com/surrealdb/surrealdb.go/issues/273
+
+		// Note that we cannot send the response to the response channel,
+		// because the response did not have an ID field,
+		// so we cannot find the response channel to send it to.
+		// Instead, we just log the error and return,
+		// in the hope that the caller notices the programming error
+		// by the RPC timing out, and the error being logged here.
+		c.logger.Error(
+			fmt.Sprintf("error in response: %v", rpcRes.Error),
+			"result", fmt.Sprint(rpcRes.Result),
+		)
+		return
+	} else {
+		// todo: find a surefire way to confirm a notification
+
+		notificationRes, err := rpcRes.Result.MarshalCBOR()
+		if err != nil {
+			c.logger.Error(
+				fmt.Sprintf("error marshaling notification result: %v", err),
+				"result", fmt.Sprint(rpcRes.Result),
+			)
+			return
+		}
+
+		var notification connection.Notification
+		if err := c.Unmarshaler.Unmarshal(notificationRes, &notification); err != nil {
+			c.logger.Error(
+				fmt.Sprintf("error unmarshaling as notification: %v", err),
+				"result", fmt.Sprint(rpcRes.Result),
+			)
+			return
+		}
+
+		channelID := notification.ID
+
+		if channelID == nil {
+			c.logger.Error(
+				"response did not contain an 'id' field",
+				"result", fmt.Sprint(rpcRes.Result),
+			)
+			return
+		}
+
+		if !c.SendNotification(channelID.String(), notification) {
+			msg := fmt.Sprintf("dropped notification for ended live query %+v", channelID.String())
+			if notification.Action == connection.KilledAction {
+				// Expected: Kill closes the notifications as soon as the
+				// server answers, which can be before KILLED arrives.
+				c.logger.Debug(msg)
+			} else {
+				c.logger.Error(msg, "result", fmt.Sprint(rpcRes.Result))
+			}
+		}
+	}
+}

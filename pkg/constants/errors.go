@@ -1,0 +1,38 @@
+package constants
+
+import "errors"
+
+// Errors
+var (
+	InvalidResponse = errors.New("invalid SurrealDB response") //nolint:staticcheck
+	ErrQuery        = errors.New("error occurred processing the SurrealDB query")
+	ErrNoRow        = errors.New("error no row")
+)
+
+var (
+	ErrIDInUse       = errors.New("id already in use")
+	ErrNoBaseURL     = errors.New("base url not set")
+	ErrNoMarshaler   = errors.New("marshaler is not set")
+	ErrNoUnmarshaler = errors.New("unmarshaler is not set")
+	// Deprecated: the HTTP connection no longer requires a namespace and database
+	// before every request, and does not return this error.
+	ErrNoNamespaceOrDB    = errors.New("namespace or database or both are not set")
+	ErrMethodNotAvailable = errors.New("method not available on this connection")
+
+	// Session and transaction errors
+	ErrSessionsNotSupported     = errors.New("sessions require WebSocket connection")
+	ErrTransactionsNotSupported = errors.New("interactive transactions require WebSocket connection")
+	ErrSessionClosed            = errors.New("session already detached")
+	ErrTransactionClosed        = errors.New("transaction already committed or canceled")
+	// ErrForkTokenExpired is returned by Fork when the access token the
+	// session was signed in with has expired, as the fork would be signed in
+	// with that token.
+	ErrForkTokenExpired = errors.New("cannot fork: the session's access token has expired")
+	// ErrForkUntracked is returned by Fork for a session this client did not
+	// attach, as the client does not know its state.
+	ErrForkUntracked = errors.New("cannot fork a session this client did not attach")
+	// ErrNeedsCBOR2 is wrapped by the error returned when a value with no
+	// plain CBOR form, such as a models.Regex, is encoded as plain CBOR.
+	// cbor.2 carries it.
+	ErrNeedsCBOR2 = errors.New("the value can only be sent over cbor.2")
+)

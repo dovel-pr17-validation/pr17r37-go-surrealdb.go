@@ -1,0 +1,90 @@
+package surrealcbor
+
+import (
+	"io"
+	"reflect"
+
+	"github.com/fxamacker/cbor/v2"
+	"github.com/surrealdb/surrealdb.go/v2/pkg/models"
+
+	"github.com/surrealdb/surrealdb.go/v2/internal/cborwire"
+)
+
+// getEncMode returns encoder mode using fxamacker/cbor
+func getEncMode() cbor.EncMode {
+	tags := cbor.NewTagSet()
+
+	// Register SurrealDB custom types
+	customTypes := []struct {
+		tag uint64
+		typ any
+	}{
+		{models.TagNone, models.CustomNil{}},
+		{models.TagTable, models.Table("")},
+		{models.TagRecordID, models.RecordID{}},
+		{models.TagCustomDatetime, models.CustomDateTime{}},
+		{models.TagCustomDuration, models.CustomDuration{}},
+		{models.TagFuture, models.Future{}},
+		{models.TagStringUUID, models.UUIDString("")},
+		{models.TagStringDecimal, models.DecimalString("")},
+		{models.TagStringDuration, models.CustomDurationString("")},
+		{models.TagSpecBinaryUUID, models.UUID{}},
+		{models.TagFile, models.File{}},
+		{models.TagSet, models.Set{}},
+		{models.TagGeometryPoint, models.GeometryPoint{}},
+		{models.TagGeometryLine, models.GeometryLine{}},
+		{models.TagGeometryPolygon, models.GeometryPolygon{}},
+		{models.TagGeometryMultiPoint, models.GeometryMultiPoint{}},
+		{models.TagGeometryMultiLine, models.GeometryMultiLine{}},
+		{models.TagGeometryMultiPolygon, models.GeometryMultiPolygon{}},
+		{models.TagGeometryCollection, models.GeometryCollection{}},
+	}
+
+	for _, ct := range customTypes {
+		err := tags.Add(
+			cbor.TagOptions{EncTag: cbor.EncTagRequired, DecTag: cbor.DecTagRequired},
+			reflect.TypeOf(ct.typ),
+			ct.tag,
+		)
+		if err != nil {
+			panic(err)
+		}
+	}
+
+	// A bare time.Time cannot be encoded as tag 12 by this mode, as fxamacker/cbor
+	// hard-codes it. Callers go through models.PrepareForEncode, which swaps it
+	// for models.CustomDateTime first. These options only apply to any time.Time
+	// that slips through, as tag 0, which cborwire.Normalize rewrites as tag 12.
+	em, err := cbor.EncOptions{
+		Time:    cbor.TimeRFC3339Nano,
+		TimeTag: cbor.EncTagRequired,
+	}.EncModeWithTags(tags)
+	if err != nil {
+		panic(err)
+	}
+
+	return em
+}
+
+// Encoder writes CBOR values to an output stream
+type Encoder struct {
+	w  io.Writer
+	em cbor.EncMode
+}
+
+// Encode writes the CBOR encoding of v to the stream
+func (enc *Encoder) Encode(v any) error {
+	// Use fxamacker/cbor marshaling which automatically handles:
+	// - Types implementing cbor.Marshaler (including our Marshaler interface)
+	// - Built-in types and registered tags
+	data, err := enc.em.Marshal(models.PrepareForEncode(v))
+	if err != nil {
+		return err
+	}
+	data, err = cborwire.Normalize(data, cborwire.Plain)
+	if err != nil {
+		return err
+	}
+	_, err = enc.w.Write(data)
+	return err
+}

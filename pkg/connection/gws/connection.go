@@ -1,0 +1,571 @@
+package gws
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/fxamacker/cbor/v2"
+	"github.com/lxzan/gws"
+	"github.com/surrealdb/surrealdb.go/v2/internal/codec"
+	"github.com/surrealdb/surrealdb.go/v2/internal/rand"
+	"github.com/surrealdb/surrealdb.go/v2/internal/wsutil"
+	"github.com/surrealdb/surrealdb.go/v2/pkg/connection"
+	"github.com/surrealdb/surrealdb.go/v2/pkg/connection/rpc"
+	"github.com/surrealdb/surrealdb.go/v2/pkg/constants"
+)
+
+type Connection struct {
+	connection.Toolkit
+
+	conn *gws.Conn
+	// connLock guards conn, which Connect sets and Close clears. It is held
+	// only to read or change conn, never across a write.
+	connLock sync.Mutex
+	// writeLock lets one request at a time be written, for no longer than
+	// its context allows.
+	writeLock wsutil.WriteLock
+
+	Timeout time.Duration
+
+	// done is closed when the connection closes, by Close or because it was
+	// lost, and closeError then says why.
+	done       chan struct{}
+	closeOnce  sync.Once
+	closeMu    sync.RWMutex
+	closeError error
+	// closed is read by IsClosed without connLock, e.g. by contrib/rews
+	// checking whether to reconnect, so it is atomic.
+	closed atomic.Bool
+
+	handler *websocketHandler
+}
+
+var (
+	_ connection.Connection    = (*Connection)(nil)
+	_ connection.CloseNotifier = (*Connection)(nil)
+	_ connection.Redialer      = (*Connection)(nil)
+)
+
+type websocketHandler struct {
+	conn *Connection
+}
+
+func (h *websocketHandler) OnOpen(socket *gws.Conn) {
+	// Connection opened successfully
+}
+
+// Received a close frame from the other end of the network connection, or disconnected voluntarily due to an error in the IO process
+// In the former case, err can be asserted as *gws.CloseError.
+func (h *websocketHandler) OnClose(socket *gws.Conn, err error) {
+	// No more notifications will come, but those already received are still
+	// delivered before each live query's channel is closed. When Close is
+	// closing the connection, it has already stopped them all.
+	defer h.conn.DrainAllLiveNotifications()
+
+	if err == nil {
+		err = connection.ErrConnectionClosed
+	}
+	h.conn.markClosed(err)
+}
+
+// markClosed records that the connection closed, with err nil when Close was
+// called. Only the first call counts.
+func (c *Connection) markClosed(err error) {
+	c.closeOnce.Do(func() {
+		c.closeMu.Lock()
+		c.closeError = err
+		c.closeMu.Unlock()
+		c.closed.Store(true)
+		if c.done != nil {
+			close(c.done)
+		}
+	})
+}
+
+// Closed returns a channel which is closed when the connection closes.
+func (c *Connection) Closed() <-chan struct{} {
+	return c.done
+}
+
+// CloseError returns why the connection closed: nil after Close.
+func (c *Connection) CloseError() error {
+	c.closeMu.RLock()
+	defer c.closeMu.RUnlock()
+	return c.closeError
+}
+
+// closedError is the error for a request on a closed connection.
+func (c *Connection) closedError() error {
+	if err := c.CloseError(); err != nil && !errors.Is(err, connection.ErrConnectionClosed) {
+		return fmt.Errorf("%w: %w", connection.ErrConnectionClosed, err)
+	}
+	return connection.ErrConnectionClosed
+}
+
+// Redial returns a new connection to the same server, with the same
+// configuration, for reconnecting after this one is lost.
+func (c *Connection) Redial() connection.Connection {
+	n := New(&connection.Config{
+		BaseURL:       c.BaseURL,
+		Marshaler:     c.Marshaler,
+		Unmarshaler:   c.Unmarshaler,
+		Logger:        c.Logger,
+		DisableCBORv2: c.DisableCBORv2,
+	})
+	n.Timeout = c.Timeout
+	return n
+}
+
+func (h *websocketHandler) OnMessage(socket *gws.Conn, message *gws.Message) {
+	defer message.Close()
+	h.conn.handleResponse(message.Bytes())
+}
+
+func (h *websocketHandler) OnPing(socket *gws.Conn, payload []byte) {
+}
+
+func (h *websocketHandler) OnPong(socket *gws.Conn, payload []byte) {
+}
+
+// write sends v as one message. It waits for the writes before it only as
+// long as ctx allows, so that a write which the server or the network stops
+// taking holds up neither the requests after it nor Close.
+//
+// The write itself is not stopped when ctx ends: gws closes the connection
+// when a write fails, so stopping it would close the connection for every
+// request on it. It is bounded by Timeout instead, as a write which takes
+// longer means the other end has stopped reading.
+func (c *Connection) write(ctx context.Context, v any) error {
+	data, err := c.Marshaler.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	if lockErr := c.writeLock.Lock(ctx); lockErr != nil {
+		return lockErr
+	}
+	defer c.writeLock.Unlock()
+
+	// gws writes on the network connection as it is, so the deadline is set
+	// on it, and lifted after the write, as gws answers pings on it too. Both
+	// are done under connLock, so that the deadline Close sets to stop a stuck
+	// write stays set.
+	c.connLock.Lock()
+	conn := c.conn
+	if conn == nil {
+		c.connLock.Unlock()
+		return errors.New("connection is closed")
+	}
+	netConn := conn.NetConn()
+	var deadline time.Time
+	if c.Timeout > 0 {
+		deadline = time.Now().Add(c.Timeout)
+	}
+	err = netConn.SetWriteDeadline(deadline)
+	c.connLock.Unlock()
+	if err != nil {
+		return err
+	}
+
+	err = conn.WriteMessage(gws.OpcodeBinary, data)
+
+	c.connLock.Lock()
+	if c.conn == conn {
+		_ = netConn.SetWriteDeadline(time.Time{})
+	}
+	c.connLock.Unlock()
+
+	switch {
+	case err == nil:
+		return nil
+	case wsutil.IsTimeout(err) && !deadline.IsZero() && !time.Now().Before(deadline):
+		// gws closed the connection, as the write failed.
+		return fmt.Errorf("writing the request: %w", context.DeadlineExceeded)
+	case c.IsClosed():
+		// Closed meanwhile, as by Close, which stops a write under way.
+		return c.closedError()
+	}
+	return err
+}
+
+// closeMessageTimeout bounds the write of the close message when Close is
+// given a context without a deadline.
+const closeMessageTimeout = time.Second
+
+func (c *Connection) handleResponse(data []byte) {
+	var rpcRes connection.RPCResponse[cbor.RawMessage]
+	if err := c.Unmarshaler.Unmarshal(data, &rpcRes); err != nil {
+		// This can happen when SurrealDB sent an invalid response (unlikely),
+		// or the cbor library failed unmarshaling Result into even cbor.RawMessage due to
+		// configurable limits like fxamacker/cbor.MaxArrayElements that applies to RPCResponse.Result (more likely).
+		//
+		// We log the error and return to prevent:
+		// 1. DoS attacks from malformed CBOR data causing panics
+		// 2. Memory exhaustion from falling back to default unmarshaler with no limits
+		c.logError(
+			"Failed to unmarshal response",
+			"error", err,
+		)
+		return
+	}
+
+	if rpcRes.ID != nil && rpcRes.ID != "" {
+		// Handle RPC response
+		c.DeliverResponse(fmt.Sprintf("%v", rpcRes.ID), rpcRes)
+	} else if rpcRes.Result == nil && rpcRes.Error != nil {
+		// Some error cases result in the lack of an ID field in the response,
+		// so we handle the error here,
+		// rather than unintentionally treating it as a notification.
+		// See https://github.com/surrealdb/surrealdb.go/issues/273
+
+		// Note that we cannot send the response to the response channel,
+		// because the response did not have an ID field,
+		// so we cannot find the response channel to send it to.
+		// Instead, we just log the error and return,
+		// in the hope that the caller notices the programming error
+		// by the RPC timing out, and the error being logged here.
+		c.logError(
+			fmt.Sprintf("error in response: %v", rpcRes.Error),
+			"result", fmt.Sprint(rpcRes.Result),
+		)
+		return
+	} else {
+		// Handle notification
+		notificationRes, err := rpcRes.Result.MarshalCBOR()
+		if err != nil {
+			return
+		}
+
+		var notification connection.Notification
+		if err := c.Unmarshaler.Unmarshal(notificationRes, &notification); err != nil {
+			return
+		}
+
+		if notification.ID == nil {
+			return
+		}
+
+		if !c.SendNotification(notification.ID.String(), notification) {
+			msg := fmt.Sprintf("dropped notification for ended live query %+v", notification.ID.String())
+			if notification.Action == connection.KilledAction {
+				// Expected: Kill closes the notifications as soon as the
+				// server answers, which can be before KILLED arrives.
+				c.logDebug(msg)
+			} else {
+				c.logError(msg)
+			}
+		}
+	}
+}
+
+// New creates a new WebSocket connection based on gws
+func New(params *connection.Config) *Connection {
+	conn := &Connection{
+		Timeout: constants.DefaultWSTimeout,
+	}
+	conn.BaseURL = params.BaseURL
+	conn.Marshaler = params.Marshaler
+	conn.Unmarshaler = params.Unmarshaler
+	conn.DisableCBORv2 = params.DisableCBORv2
+	conn.ResponseChannels = make(map[string]chan connection.RPCResponse[cbor.RawMessage])
+	conn.NotificationChannels = make(map[string]chan connection.Notification)
+	conn.Logger = params.Logger
+	conn.done = make(chan struct{})
+
+	return conn
+}
+
+// SetTimeout sets the timeout for RPC responses
+func (c *Connection) SetTimeout(timeout time.Duration) *Connection {
+	c.Timeout = timeout
+	return c
+}
+
+// Close implements connection.Connection.
+func (c *Connection) Close(ctx context.Context) error {
+	// End every live query's notifications and stop their goroutines, as no
+	// more will come, including those still delivering what was received
+	// before the connection was lost.
+	defer c.CloseAllLiveNotifications()
+
+	c.connLock.Lock()
+	defer c.connLock.Unlock()
+
+	if c.conn == nil {
+		return nil
+	}
+
+	// Signal closing
+	c.markClosed(nil)
+
+	// The deadline bounds the close message, and a request whose write is
+	// stuck, which the close message would otherwise wait for.
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		deadline = time.Now().Add(closeMessageTimeout)
+	}
+	_ = c.conn.NetConn().SetWriteDeadline(deadline)
+	err := c.conn.WriteClose(constants.CloseMessageCode, []byte(""))
+	if err != nil {
+		c.logError("failed to close WebSocket connection", "error", err)
+	}
+
+	if err := c.conn.NetConn().Close(); err != nil {
+		c.logError("failed to close underlying network connection", "error", err)
+	}
+	c.conn = nil
+
+	return nil
+}
+
+func (c *Connection) IsClosed() bool {
+	return c.closed.Load()
+}
+
+// Connect tries to establish a WebSocket connection to SurrealDB.
+// This method must be called after New and before any other operations.
+//
+// For simplicity, this method does not check if the connection is already being
+// established, has been established, or has been closed.
+// It will always try to establish a new connection.
+// So, it is the caller's responsibility to ensure that
+// this method is called only when the connection is not established yet.
+//
+// Do not call this method to reconnect already closed connections.
+// To reconnect, you should create a new instance of Connection
+// and call Connect on it.
+//
+// This is to prevent it to have many internal states that would lead to complexity and bugs.
+// You should assume gws.Connection to have only three states:
+// 1. Pending: gws.Connection is instantiated but not connected yet, or it is in the process of connecting.
+// 2. Connected: gws.Connection is connected and ready to use.
+// 3. Closed: gws.Connection is closed and cannot be used anymore.
+//
+// Once you reach 3, you can use IsClosed to check if the connection is closed,
+// so that a high-level feature can be implemented to reconnect automatically.
+func (c *Connection) Connect(ctx context.Context) error {
+	c.handler = &websocketHandler{conn: c}
+
+	option := &gws.ClientOption{
+		Addr: fmt.Sprintf("%s/rpc", c.BaseURL),
+		// The header name is deliberately not canonicalised. gws looks the
+		// offered subprotocols up by the canonical name to check the server
+		// picked one, and that check would refuse a server that picks none,
+		// which this connection has always tolerated. The response header
+		// says which one the server picked.
+		RequestHeader: http.Header{
+			"Sec-WebSocket-Protocol": []string{strings.Join(c.CBORSubprotocols(), ", ")},
+		},
+		PermessageDeflate: gws.PermessageDeflate{
+			Enabled: true,
+		},
+	}
+
+	conn, resp, err := gws.NewClient(c.handler, option)
+	var subprotocol string
+	if resp != nil {
+		subprotocol = resp.Header.Get("Sec-WebSocket-Protocol")
+	}
+	if resp != nil {
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			c.logError("failed to close response body", "error", closeErr)
+		}
+	}
+	if err != nil {
+		return err
+	}
+
+	c.connLock.Lock()
+	defer c.connLock.Unlock()
+
+	c.UseCBORSubprotocol(subprotocol)
+	c.conn = conn
+
+	// Start reading messages
+	go conn.ReadLoop()
+
+	return nil
+}
+
+// HTTPEndpoint returns the server's base URL and the HTTP client to reach it with.
+func (c *Connection) HTTPEndpoint() (baseURL string, client *http.Client) {
+	return c.BaseURL, nil
+}
+
+// Health asks the server whether it is healthy, with GET /health over HTTP.
+func (c *Connection) Health(ctx context.Context) error {
+	return connection.CheckHealth(ctx, nil, c.BaseURL)
+}
+
+// GetUnmarshaler implements connection.Connection.
+func (c *Connection) GetUnmarshaler() codec.Unmarshaler {
+	return c.Unmarshaler
+}
+
+// GetMarshaler returns the marshaler the connection encodes requests with.
+func (c *Connection) GetMarshaler() codec.Marshaler {
+	return c.Marshaler
+}
+
+// Let implements connection.Connection.
+func (c *Connection) Let(ctx context.Context, key string, value any) error {
+	return connection.Send[any](c, ctx, nil, "let", key, value)
+}
+
+func (c *Connection) Authenticate(ctx context.Context, token string) error {
+	return rpc.Authenticate(c, ctx, token)
+}
+
+func (c *Connection) SignUp(ctx context.Context, authData any) (string, error) {
+	return rpc.SignUp(c, ctx, authData)
+}
+
+func (c *Connection) SignIn(ctx context.Context, authData any) (string, error) {
+	return rpc.SignIn(c, ctx, authData)
+}
+
+func (c *Connection) SignUpWithRefresh(ctx context.Context, authData any) (*connection.Tokens, error) {
+	return rpc.SignUpWithRefresh(c, ctx, authData)
+}
+
+func (c *Connection) SignInWithRefresh(ctx context.Context, authData any) (*connection.Tokens, error) {
+	return rpc.SignInWithRefresh(c, ctx, authData)
+}
+
+func (c *Connection) Invalidate(ctx context.Context) error {
+	return rpc.Invalidate(c, ctx)
+}
+
+// LiveNotifications implements connection.Connection.
+func (c *Connection) LiveNotifications(id string) (chan connection.Notification, error) {
+	return c.CreateNotificationChannel(id)
+}
+
+// CloseLiveNotifications implements connection.Connection.
+func (c *Connection) CloseLiveNotifications(id string) error {
+	return c.Toolkit.CloseLiveNotifications(id)
+}
+
+// Send implements connection.Connection.
+func (c *Connection) Send(ctx context.Context, method string, params ...any) (*connection.RPCResponse[cbor.RawMessage], error) {
+	request := &connection.RPCRequest{
+		Method: method,
+		Params: params,
+	}
+	return c.Call(ctx, request)
+}
+
+// Call implements connection.Connection.
+// Unlike Send, Call accepts an RPCRequest directly, allowing you to set
+// Session and Txn fields for session-scoped or transaction-scoped operations.
+func (c *Connection) Call(ctx context.Context, req *connection.RPCRequest) (*connection.RPCResponse[cbor.RawMessage], error) {
+	if c.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, c.Timeout)
+		defer cancel()
+	}
+
+	select {
+	case <-c.done:
+		return nil, c.closedError()
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+
+	// Set request ID if not already set
+	id := req.ID
+	if id == nil || id == "" {
+		id = rand.NewRequestID(constants.RequestIDLength)
+		req.ID = id
+	}
+
+	c.logDebug("Sending RPC request", "id", id, "method", req.Method)
+
+	responseChan, err := c.CreateResponseChannel(fmt.Sprintf("%v", id))
+	if err != nil {
+		return nil, err
+	}
+	defer c.RemoveResponseChannel(fmt.Sprintf("%v", id))
+
+	if err := c.write(ctx, req); err != nil {
+		return nil, err
+	}
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-c.done:
+		return nil, c.closedError()
+	case rpcRes, open := <-responseChan:
+		if !open {
+			return nil, errors.New("response channel closed")
+		}
+
+		if rpcRes.Error != nil {
+			return nil, rpcRes.Error
+		}
+		return &rpcRes, nil
+	}
+}
+
+// CallStream sends a request answered by many responses, such as
+// query_stream, and returns the stream they arrive on.
+func (c *Connection) CallStream(ctx context.Context, req *connection.RPCRequest) (*connection.ResponseStream, error) {
+	select {
+	case <-c.done:
+		return nil, c.closeErr()
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+
+	if req.ID == nil || req.ID == "" {
+		req.ID = rand.NewRequestID(constants.RequestIDLength)
+	}
+
+	stream, err := c.OpenResponseStream(fmt.Sprintf("%v", req.ID), c.done, c.closeErr)
+	if err != nil {
+		return nil, err
+	}
+	stream.FirstResponseTimeout = c.Timeout
+	if err := c.write(ctx, req); err != nil {
+		stream.Close()
+		return nil, err
+	}
+	return stream, nil
+}
+
+// closeErr is the error for a request on the closed connection: never nil,
+// even after a clean Close.
+func (c *Connection) closeErr() error {
+	return connection.ClosedError(c.CloseError())
+}
+
+// Unset implements connection.Connection.
+func (c *Connection) Unset(ctx context.Context, key string) error {
+	return connection.Send[any](c, ctx, nil, "unset", key)
+}
+
+// Use implements connection.Connection.
+func (c *Connection) Use(ctx context.Context, namespace, database string) error {
+	return connection.Send[any](c, ctx, nil, "use", namespace, database)
+}
+
+func (c *Connection) logDebug(msg string, args ...any) {
+	if c.Logger != nil {
+		c.Logger.Debug(msg, args...)
+	}
+}
+
+func (c *Connection) logError(msg string, args ...any) {
+	if c.Logger != nil {
+		c.Logger.Error(msg, args...)
+	}
+}

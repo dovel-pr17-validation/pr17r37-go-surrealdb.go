@@ -1,0 +1,789 @@
+package surrealdb_test
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/surrealdb/surrealdb.go/v2"
+
+	"github.com/stretchr/testify/suite"
+	"github.com/surrealdb/surrealdb.go/v2/contrib/testenv"
+	"github.com/surrealdb/surrealdb.go/v2/pkg/connection"
+	"github.com/surrealdb/surrealdb.go/v2/pkg/models"
+)
+
+// Default const and vars for testing
+const (
+	defaultURL = "ws://localhost:8000"
+)
+
+var currentURL = os.Getenv("SURREALDB_URL")
+
+func getURL() string {
+	if currentURL == "" {
+		return defaultURL
+	}
+	return currentURL
+}
+
+// TestDBSuite is a test s for the DB struct
+type SurrealDBTestSuite struct {
+	suite.Suite
+	db   *surrealdb.DB
+	name string
+}
+
+// a simple user struct for testing
+type testUser struct {
+	Username string           `json:"username,omitempty"`
+	Password string           `json:"password,omitempty"`
+	ID       *models.RecordID `json:"id,omitempty"`
+}
+
+type testPerson struct {
+	FirstName string           `json:"firstname,omitempty"`
+	LastName  string           `json:"lastname,omitempty"`
+	ID        *models.RecordID `json:"id,omitempty"`
+}
+
+// assertContains performs an assertion on a list, asserting that at least one element matches a provided condition.
+// All the matching elements are returned from this function, which can be used as a filter.
+func assertContains[K any](s *SurrealDBTestSuite, input []K, matcher func(K) bool) []K {
+	matching := make([]K, 0)
+	for _, v := range input {
+		if matcher(v) {
+			matching = append(matching, v)
+		}
+	}
+	s.NotEmptyf(matching, "Input %+v did not contain matching element", fmt.Sprintf("%+v", input))
+	return matching
+}
+
+func TestSurrealDBSuite(t *testing.T) {
+	s := new(SurrealDBTestSuite)
+
+	s.name = "Test_DB"
+	suite.Run(t, s)
+}
+
+// SetupTest is called before each test
+func (s *SurrealDBTestSuite) SetupTest() {
+	// Create tables that tests expect to exist, as SurrealDB requires tables
+	// to exist before querying them.
+	tables := []string{"users", "persons", "knows", "person", "newuser"}
+	for _, table := range tables {
+		_, _ = surrealdb.Query[any](context.Background(), s.db, "DEFINE TABLE "+table, nil)
+	}
+}
+
+// TearDownTest is called after each test
+func (s *SurrealDBTestSuite) TearDownTest() {
+	// Use Query with REMOVE TABLE IF EXISTS for cleanup, as the Delete RPC
+	// method returns an error for a table that does not exist.
+	tables := []string{"users", "persons", "knows", "person", "newuser"}
+	for _, table := range tables {
+		_, _ = surrealdb.Query[any](context.Background(), s.db, "REMOVE TABLE IF EXISTS "+table, nil)
+	}
+}
+
+// TearDownSuite is called after the s has finished running
+func (s *SurrealDBTestSuite) TearDownSuite() {
+	err := s.db.Close(context.Background())
+	s.Require().NoError(err)
+}
+
+// SetupSuite is called before the s starts running
+func (s *SurrealDBTestSuite) SetupSuite() {
+	db, err := surrealdb.FromEndpointURLString(context.Background(), getURL())
+	s.Require().NoError(err, "should not return an error when initializing db")
+	s.db = db
+
+	// For HTTP connections, Use() must be called before SignIn() because HTTP
+	// requires namespace/database headers on every request.
+	err = db.Use(context.Background(), "test", "test")
+	s.Require().NoError(err, "should not return an error when setting namespace and database")
+
+	_ = signIn(s)
+
+	// SurrealDB requires the namespace/database to exist before it can be used.
+	// Explicitly define them after signing in as root to ensure they exist.
+	db = testenv.MustNew("test", "test", "users")
+	s.Require().NoError(testenv.DefineSchemalessTables(db, "users"))
+}
+
+// Sign with the root user
+// Can be used with any user
+func signIn(s *SurrealDBTestSuite) string {
+	authData := &surrealdb.Auth{
+		Username: "root",
+		Password: "root",
+	}
+	token, err := s.db.SignIn(context.Background(), authData)
+	s.Require().NoError(err)
+	return token
+}
+
+func (s *SurrealDBTestSuite) TestSend_AllowedMethods() {
+	s.Run("Send method should be rejected", func() {
+		err := surrealdb.Send[any](context.Background(), s.db, nil, "let")
+		s.Require().Error(err)
+	})
+
+	s.Run("Send method should be allowed", func() {
+		err := surrealdb.Send[any](context.Background(), s.db, nil, "query", "select * from users")
+		s.Require().NoError(err)
+	})
+}
+
+func (s *SurrealDBTestSuite) TestDelete() {
+	_, err := surrealdb.Create[testUser](context.Background(), s.db, "users", testUser{
+		Username: "johnny",
+		Password: "123",
+	})
+	s.Require().NoError(err)
+
+	// Delete the users...
+	_, err = surrealdb.Delete[[]testUser](context.Background(), s.db, "users")
+	s.Require().NoError(err)
+}
+
+func (s *SurrealDBTestSuite) TestInsert() {
+	s.Run("raw map works", func() {
+		insert, err := surrealdb.Insert[testUser](context.Background(), s.db, "users", map[string]any{
+			"username": "johnny",
+			"password": "123",
+		})
+		s.Require().NoError(err)
+
+		s.Equal("johnny", (*insert)[0].Username)
+		s.Equal("123", (*insert)[0].Password)
+	})
+
+	s.Run("Single insert works", func() {
+		insert, err := surrealdb.Insert[testUser](context.Background(), s.db, "users", testUser{
+			Username: "johnny",
+			Password: "123",
+		})
+		s.Require().NoError(err)
+
+		s.Equal("johnny", (*insert)[0].Username)
+		s.Equal("123", (*insert)[0].Password)
+	})
+
+	s.Run("Multiple insert works", func() {
+		userInsert := make([]testUser, 0)
+		userInsert = append(userInsert, testUser{
+			Username: "johnny1",
+			Password: "123",
+		}, testUser{
+			Username: "johnny2",
+			Password: "123",
+		})
+		insert, err := surrealdb.Insert[testUser](context.Background(), s.db, "users", userInsert)
+		s.Require().NoError(err)
+		s.Len(*insert, 2)
+	})
+}
+
+func (s *SurrealDBTestSuite) TestPatch() {
+	recordID, err := models.ParseRecordID("users:999")
+	s.Require().NoError(err)
+	_, err = surrealdb.Create[testUser](context.Background(), s.db, *recordID, map[string]any{
+		"username": "john999",
+		"password": "123",
+	})
+	s.NoError(err)
+
+	patches := []surrealdb.PatchData{
+		{Op: "add", Path: "nickname", Value: "johnny"},
+		{Op: "add", Path: "age", Value: int(44)},
+	}
+
+	// Update the user
+	_, err = surrealdb.Patch(context.Background(), s.db, *recordID, patches)
+	s.Require().NoError(err)
+
+	user2, err := surrealdb.Select[map[string]any](context.Background(), s.db, *recordID)
+	s.Require().NoError(err)
+
+	username := (*user2)["username"].(string)
+	data := (*user2)["age"].(uint64)
+
+	s.Equal("john999", username) // Ensure username hasn't change
+	s.EqualValues(patches[1].Value, data)
+}
+
+func (s *SurrealDBTestSuite) TestUpdate() {
+	newPassword := "456"
+	users := []testUser{
+		{Username: "Johnny", Password: "123"},
+		{Username: "Mat", Password: "555"},
+	}
+
+	// Create users using RecordID (not Table), which returns a single object.
+	// "Create with Table" means specifying only the table name (e.g., models.Table("users"))
+	// and letting SurrealDB generate record IDs automatically. It returns an array,
+	// which does not unmarshal into a single testUser.
+	var createdUsers []testUser
+	for i, v := range users {
+		recordID := models.NewRecordID("users", fmt.Sprintf("user%d", i))
+		createdUser, err := surrealdb.Create[testUser](context.Background(), s.db, recordID, v)
+		s.Require().NoError(err)
+		createdUsers = append(createdUsers, *createdUser)
+	}
+
+	createdUsers[0].Password = newPassword
+
+	// Update the user
+	updatedUser, err := surrealdb.Update[testUser](context.Background(), s.db, *(createdUsers)[0].ID, createdUsers[0])
+	s.Require().NoError(err)
+
+	// Check if password changes
+	s.Equal(newPassword, updatedUser.Password)
+
+	// select controlUser
+	controlUser, err := surrealdb.Select[testUser](context.Background(), s.db, *createdUsers[1].ID)
+	s.Require().NoError(err)
+
+	// check control user is changed or not
+	s.Equal(createdUsers[1], *controlUser)
+}
+
+func (s *SurrealDBTestSuite) TestLiveViaMethod() {
+	if strings.HasPrefix(getURL(), "http") {
+		s.T().Skip("Live queries are not supported in HTTP connection")
+		return
+	}
+
+	live, err := surrealdb.Live(context.Background(), s.db, "users", false)
+	s.Require().NoError(err, "should not return error on live request")
+
+	defer func() {
+		err = surrealdb.Kill(context.Background(), s.db, live.String())
+		s.Require().NoError(err)
+	}()
+
+	notifications, err := s.db.LiveNotifications(live.String())
+	s.Require().NoError(err)
+
+	_, e := surrealdb.Create[testUser](context.Background(), s.db, "users", map[string]any{
+		"username": "johnny",
+		"password": "123",
+	})
+	s.Require().NoError(e)
+
+	notification := <-notifications
+	s.Require().Equal(connection.CreateAction, notification.Action)
+	s.Require().Equal(live, notification.ID)
+}
+
+func (s *SurrealDBTestSuite) TestLiveViaQuery() {
+	if strings.HasPrefix(getURL(), "http") {
+		s.T().Skip("Live queries are not supported in HTTP connection")
+		return
+	}
+	res, err := surrealdb.Query[models.UUID](context.Background(), s.db, "LIVE SELECT * FROM users", map[string]any{})
+	s.Require().NoError(err)
+
+	liveID := (*res)[0].Result.String()
+
+	notifications, err := s.db.LiveNotifications(liveID)
+	s.Require().NoError(err)
+
+	defer func() {
+		err = surrealdb.Kill(context.Background(), s.db, liveID)
+		s.Require().NoError(err)
+	}()
+
+	// create user
+	_, e := surrealdb.Create[testUser](context.Background(), s.db, "users", map[string]any{
+		"username": "johnny",
+		"password": "123",
+	})
+	s.Require().NoError(e)
+	notification := <-notifications
+
+	s.Require().Equal(connection.CreateAction, notification.Action)
+	s.Require().Equal(liveID, notification.ID.String())
+}
+
+func (s *SurrealDBTestSuite) TestCreate() {
+	s.Run("raw map works", func() {
+		user, err := surrealdb.Create[testUser](context.Background(), s.db, "users", map[string]any{
+			"username": "johnny",
+			"password": "123",
+		})
+		s.Require().NoError(err)
+
+		s.Equal("johnny", user.Username)
+		s.Equal("123", user.Password)
+	})
+
+	s.Run("Single create works", func() {
+		user, err := surrealdb.Create[testUser](context.Background(), s.db, "users", testUser{
+			Username: "johnny",
+			Password: "123",
+		})
+		s.Require().NoError(err)
+
+		s.Equal("johnny", user.Username)
+		s.Equal("123", user.Password)
+	})
+
+	s.Run("Multiple creates works", func() {
+		s.T().Skip("Creating multiple records is not supported yet")
+		data := make([]testUser, 0)
+		data = append(data,
+			testUser{
+				Username: "johnny",
+				Password: "123",
+			},
+			testUser{
+				Username: "joe",
+				Password: "123",
+			})
+		users, err := surrealdb.Create[[]testUser](context.Background(), s.db, "users", data)
+		s.Require().NoError(err)
+
+		assertContains(s, *users, func(user testUser) bool {
+			return s.Contains(users, user)
+		})
+	})
+}
+
+func (s *SurrealDBTestSuite) TestSelect() {
+	createdUser, err := surrealdb.Create[testUser](context.Background(), s.db, "users", testUser{
+		Username: "johnnyjohn",
+		Password: "123",
+	})
+	s.Require().NoError(err)
+	s.NotEmpty(createdUser)
+
+	s.Run("Select many with table", func() {
+		users, err := surrealdb.Select[[]testUser](context.Background(), s.db, "users")
+		s.Require().NoError(err)
+
+		matching := assertContains(s, *users, func(item testUser) bool {
+			return item.Username == "johnnyjohn"
+		})
+		s.GreaterOrEqual(len(matching), 1)
+	})
+
+	s.Run("Select single record", func() {
+		user, err := surrealdb.Select[testUser](context.Background(), s.db, *createdUser.ID)
+		s.Require().NoError(err)
+
+		s.Equal("johnnyjohn", user.Username)
+		s.Equal("123", user.Password)
+	})
+}
+
+func (s *SurrealDBTestSuite) TestConcurrentOperations() {
+	var wg sync.WaitGroup
+	totalGoroutines := 100
+
+	s.Run(fmt.Sprintf("Concurrent select from undefined table %d", totalGoroutines), func() {
+		for i := 0; i < totalGoroutines; i++ {
+			wg.Add(1)
+			go func(j int) {
+				defer wg.Done()
+				// The table "missing" was never defined with DEFINE TABLE
+				_, err := surrealdb.Select[testUser](context.Background(), s.db, models.NewRecordID("missing", j))
+				s.Require().Error(err)
+				s.Require().Contains(err.Error(), "does not exist")
+			}(i)
+		}
+		wg.Wait()
+	})
+
+	s.Run(fmt.Sprintf("Concurrent create rows %d", totalGoroutines), func() {
+		for i := 0; i < totalGoroutines; i++ {
+			wg.Add(1)
+			go func(j int) {
+				defer wg.Done()
+				user, err := surrealdb.Create[testUser](context.Background(), s.db, models.NewRecordID("newuser", j), testUser{
+					Username: "johnny",
+					Password: "123",
+				})
+				s.Require().NoError(err)
+				s.Require().NotNil(user.ID)
+				s.Require().Equal(user.ID.Table, "newuser")
+			}(i)
+		}
+		wg.Wait()
+	})
+
+	s.Run(fmt.Sprintf("Concurrent select existing row %d", totalGoroutines), func() {
+		createdUser, err := surrealdb.Create[testUser](context.Background(), s.db, models.NewRecordID("users", "johnny"), testUser{
+			Username: "johnny",
+			Password: "123",
+		})
+		s.Require().NoError(err)
+		s.Require().NotNil(createdUser.ID)
+		s.Require().Equal(createdUser.ID.Table, "users")
+
+		for i := 0; i < totalGoroutines; i++ {
+			wg.Add(1)
+			go func(_j int) {
+				defer wg.Done()
+				user, err := surrealdb.Select[testUser](context.Background(), s.db, *createdUser.ID)
+				s.Require().NoError(err)
+				s.Require().NotNil(user.ID)
+				s.Require().Equal(user.ID.Table, "users")
+			}(i)
+		}
+		wg.Wait()
+	})
+}
+
+func (s *SurrealDBTestSuite) TestMerge() {
+	recordID, err := models.ParseRecordID("users:999")
+	s.Require().NoError(err)
+	_, err = surrealdb.Create[testUser](context.Background(), s.db, *recordID, map[string]any{
+		"username": "john999",
+		"password": "123",
+	})
+	s.NoError(err)
+
+	// Update the user
+	_, err = surrealdb.Merge[testUser](context.Background(), s.db, *recordID, map[string]string{
+		"password": "456",
+	})
+	s.Require().NoError(err)
+
+	user, err := surrealdb.Select[testUser](context.Background(), s.db, *recordID)
+	s.Require().NoError(err)
+	s.Equal("john999", user.Username) // Ensure username hasn't change.
+	s.Equal("456", user.Password)
+}
+
+func (s *SurrealDBTestSuite) TestRelateAndInsertRelation() {
+	persons, err := surrealdb.Insert[testPerson](context.Background(), s.db, "person", []testPerson{
+		{FirstName: "Mary", LastName: "Doe"},
+		{FirstName: "John", LastName: "Doe"},
+	})
+	s.Require().NoError(err)
+
+	s.Run("Test 'insert_relation' method", func() {
+		relationship := surrealdb.Relationship{
+			In:       *(*persons)[0].ID,
+			Out:      *(*persons)[1].ID,
+			Relation: "knows",
+			Data: map[string]any{
+				"since": time.Now(),
+			},
+		}
+		res, err := surrealdb.InsertRelation[[]connection.ResponseID[models.RecordID]](context.Background(), s.db, &relationship)
+		s.Require().NotNil(res)
+		s.Require().NoError(err)
+		s.Assert().NotNil((*res)[0].ID)
+	})
+
+	s.Run("Test 'relate' method", func() {
+		relationship := surrealdb.Relationship{
+			In:       *(*persons)[0].ID,
+			Out:      *(*persons)[1].ID,
+			Relation: "knows",
+			Data: map[string]any{
+				"since": time.Now(),
+			},
+		}
+		res, err := surrealdb.Relate[connection.ResponseID[models.RecordID]](context.Background(), s.db, &relationship)
+		s.Require().NotNil(res)
+		s.Require().NoError(err)
+		s.Assert().NotNil(res.ID)
+	})
+}
+
+func (s *SurrealDBTestSuite) TestQueryRaw() {
+	queries := []surrealdb.QueryStmt{
+		{SQL: "CREATE person SET name = 'John'"},
+		{SQL: "SELECT * FROM type::table($tb)", Vars: map[string]any{"tb": "person"}},
+	}
+
+	err := surrealdb.QueryRaw(context.Background(), s.db, &queries)
+	s.Require().NoError(err)
+
+	var created []testPerson
+	err = queries[0].GetResult(&created)
+	s.Require().NoError(err)
+
+	var selected []testPerson
+	err = queries[1].GetResult(&selected)
+	s.Require().NoError(err)
+}
+
+func (s *SurrealDBTestSuite) TestVersion() {
+	s.Run("returns version data", func() {
+		ver, err := s.db.Version(context.Background())
+		s.Require().NoError(err)
+		s.Require().NotNil(ver)
+	})
+}
+
+func (s *SurrealDBTestSuite) TestLetUnset() {
+	s.Run("let sets variable readable via query", func() {
+		err := s.db.Let(context.Background(), "testvar", "hello")
+		s.Require().NoError(err)
+
+		result, err := surrealdb.Query[string](context.Background(), s.db, "RETURN $testvar", nil)
+		s.Require().NoError(err)
+		s.Require().NotNil(result)
+		s.Equal("hello", (*result)[0].Result)
+	})
+
+	s.Run("unset removes variable", func() {
+		err := s.db.Let(context.Background(), "testvar2", "world")
+		s.Require().NoError(err)
+
+		err = s.db.Unset(context.Background(), "testvar2")
+		s.Require().NoError(err)
+
+		result, err := surrealdb.Query[any](context.Background(), s.db, "RETURN $testvar2", nil)
+		s.Require().NoError(err)
+		s.Require().NotNil(result)
+		s.Nil((*result)[0].Result)
+	})
+
+	s.Run("let with NONE removes variable", func() {
+		err := s.db.Let(context.Background(), "testvar3", "world")
+		s.Require().NoError(err)
+
+		err = s.db.Let(context.Background(), "testvar3", models.None)
+		s.Require().NoError(err)
+
+		result, err := surrealdb.Query[any](context.Background(), s.db, "RETURN $testvar3", nil)
+		s.Require().NoError(err)
+		s.Require().NotNil(result)
+		s.Nil((*result)[0].Result)
+	})
+
+	s.Run("let refuses a protected name", func() {
+		err := s.db.Let(context.Background(), "session", "x")
+		s.Require().Error(err)
+
+		_, err = surrealdb.Query[any](context.Background(), s.db, "RETURN 1", nil)
+		s.Require().NoError(err)
+	})
+}
+
+func (s *SurrealDBTestSuite) TestUpsert() {
+	s.Run("creates record if not exists", func() {
+		user, err := surrealdb.Upsert[testUser](context.Background(), s.db,
+			models.NewRecordID("users", "upsert1"),
+			testUser{Username: "upsert_user", Password: "pass"})
+		s.Require().NoError(err)
+		s.Require().NotNil(user)
+		s.Equal("upsert_user", user.Username)
+	})
+
+	s.Run("updates record if exists", func() {
+		_, err := surrealdb.Upsert[testUser](context.Background(), s.db,
+			models.NewRecordID("users", "upsert2"),
+			testUser{Username: "original", Password: "pass"})
+		s.Require().NoError(err)
+
+		user, err := surrealdb.Upsert[testUser](context.Background(), s.db,
+			models.NewRecordID("users", "upsert2"),
+			testUser{Username: "updated", Password: "pass"})
+		s.Require().NoError(err)
+		s.Require().NotNil(user)
+		s.Equal("updated", user.Username)
+	})
+}
+
+func (s *SurrealDBTestSuite) TestInvalidate() {
+	s.Run("invalidates session", func() {
+		err := s.db.Invalidate(context.Background())
+		s.Require().NoError(err)
+
+		// Re-sign in so other tests are not affected
+		_ = signIn(s)
+	})
+}
+
+func (s *SurrealDBTestSuite) TestRPCError() {
+	s.Run("Test valid query", func() {
+		_, err := surrealdb.Query[[]testUser](context.Background(), s.db, "SELECT * FROM users", map[string]any{})
+		s.Require().NoError(err)
+	})
+
+	s.Run("Test invalid query", func() {
+		_, err := surrealdb.Query[[]testUser](context.Background(), s.db, "SELEC * FROM users", map[string]any{})
+		s.Require().Error(err)
+	})
+}
+
+func (s *SurrealDBTestSuite) TestQueryRaw_alignment() {
+	ctx := context.Background()
+
+	s.Run("trailing semicolons and line comments", func() {
+		queries := []surrealdb.QueryStmt{
+			{SQL: "RETURN 1;"},
+			{SQL: "RETURN 2 -- the second"},
+			{SQL: "RETURN $x;  ", Vars: map[string]any{"x": 3}},
+		}
+		s.Require().NoError(surrealdb.QueryRaw(ctx, s.db, &queries))
+		for i, want := range []int{1, 2, 3} {
+			var got int
+			s.Require().NoError(queries[i].GetResult(&got))
+			s.Equal(want, got)
+		}
+	})
+
+	s.Run("a statement which yields no result", func() {
+		queries := []surrealdb.QueryStmt{
+			{SQL: "RETURN 1"},
+			{SQL: "/* nothing */"},
+		}
+		var err error
+		s.Require().NotPanics(func() {
+			err = surrealdb.QueryRaw(ctx, s.db, &queries)
+		})
+		s.Require().Error(err)
+		s.Contains(err.Error(), "exactly one statement")
+	})
+
+	s.Run("a statement holding two statements", func() {
+		queries := []surrealdb.QueryStmt{
+			{SQL: "RETURN 1; RETURN 2"},
+			{SQL: "RETURN 3"},
+		}
+		err := surrealdb.QueryRaw(ctx, s.db, &queries)
+		s.Require().Error(err)
+		s.Contains(err.Error(), "exactly one statement")
+		s.Nil(queries[1].Result.Result, "no result is assigned to the wrong statement")
+	})
+
+	s.Run("two statements in one and none in another", func() {
+		// The server returns as many results as there are QueryStmts,
+		// but the second result belongs to the first QueryStmt.
+		for _, empty := range []string{"/* nothing */", "-- nothing"} {
+			queries := []surrealdb.QueryStmt{
+				{SQL: "RETURN 1; RETURN 2"},
+				{SQL: empty},
+			}
+			err := surrealdb.QueryRaw(ctx, s.db, &queries)
+			s.Require().Error(err, empty)
+			s.Contains(err.Error(), "statement 0 did not yield exactly one result")
+			s.Nil(queries[0].Result.Result, "no result is assigned")
+			s.Nil(queries[1].Result.Result, "no result is assigned to the wrong statement")
+		}
+	})
+
+	s.Run("an empty statement", func() {
+		queries := []surrealdb.QueryStmt{{SQL: "RETURN 1"}, {SQL: " ; "}}
+		s.Require().Error(surrealdb.QueryRaw(ctx, s.db, &queries))
+	})
+
+	// SurrealDB 3.x does not return one result per statement for a transaction
+	// canceled after a failure, or for one with a RETURN in it, so QueryRaw
+	// cannot match its results to the statements. It returns an error rather
+	// than give a statement another's result.
+	v4 := getVersion(s.T()).IsV4OrLater()
+
+	s.Run("a failed transaction", func() {
+		// Once THROW fails the transaction, the server runs neither the statements
+		// nor the markers after it, and returns an error in place of each.
+		for _, end := range []string{"COMMIT", "CANCEL"} {
+			queries := []surrealdb.QueryStmt{
+				{SQL: "BEGIN"},
+				{SQL: "CREATE users:queryraw_tx"},
+				{SQL: "THROW 'boom'"},
+				{SQL: "RETURN 5"},
+				{SQL: end},
+				{SQL: "RETURN 6"},
+			}
+			if !v4 && end == "CANCEL" {
+				err := surrealdb.QueryRaw(ctx, s.db, &queries)
+				s.Require().Error(err, end)
+				s.Contains(err.Error(), "cannot be matched to the statements", end)
+				continue
+			}
+			s.Require().NoError(surrealdb.QueryRaw(ctx, s.db, &queries), end)
+			s.Equal("OK", queries[0].Result.Status, "BEGIN")
+			for _, q := range queries[1:4] {
+				s.Equal("ERR", q.Result.Status, q.SQL)
+			}
+			var msg string
+			s.Require().NoError(queries[2].GetResult(&msg))
+			s.Contains(msg, "boom")
+			if end == "COMMIT" {
+				s.Equal("ERR", queries[4].Result.Status, "COMMIT after a failure")
+			} else {
+				s.Equal("OK", queries[4].Result.Status, "CANCEL after a failure")
+			}
+			var six int
+			s.Require().NoError(queries[5].GetResult(&six), "after the transaction")
+			s.Equal(6, six)
+		}
+	})
+
+	s.Run("a transaction", func() {
+		for _, end := range []string{"COMMIT", "CANCEL"} {
+			queries := []surrealdb.QueryStmt{
+				{SQL: "BEGIN TRANSACTION"},
+				{SQL: "UPSERT users:queryraw_txn"},
+				{SQL: end + " TRANSACTION;"},
+				{SQL: "RETURN 2"},
+			}
+			s.Require().NoError(surrealdb.QueryRaw(ctx, s.db, &queries), end)
+			for _, q := range queries {
+				s.NotEmpty(q.Result.Status, q.SQL)
+			}
+			var two int
+			s.Require().NoError(queries[3].GetResult(&two))
+			s.Equal(2, two)
+		}
+	})
+
+	s.Run("RETURN in a transaction", func() {
+		// The statements after a RETURN in a transaction still run.
+		queries := []surrealdb.QueryStmt{
+			{SQL: "BEGIN"},
+			{SQL: "UPSERT users:queryraw_return"},
+			{SQL: "RETURN true"},
+			{SQL: "UPSERT users:queryraw_after_return"},
+			{SQL: "COMMIT"},
+			{SQL: "RETURN 7"},
+		}
+		if !v4 {
+			err := surrealdb.QueryRaw(ctx, s.db, &queries)
+			s.Require().Error(err)
+			s.Contains(err.Error(), "did not yield exactly one result")
+			return
+		}
+		s.Require().NoError(surrealdb.QueryRaw(ctx, s.db, &queries))
+		var ok bool
+		s.Require().NoError(queries[2].GetResult(&ok))
+		s.True(ok)
+		s.Equal("OK", queries[3].Result.Status, "UPSERT after RETURN")
+		s.Equal("OK", queries[4].Result.Status, "COMMIT")
+		var seven int
+		s.Require().NoError(queries[5].GetResult(&seven))
+		s.Equal(7, seven)
+	})
+
+	s.Run("conflicting variables", func() {
+		queries := []surrealdb.QueryStmt{
+			{SQL: "RETURN $x", Vars: map[string]any{"x": 1}},
+			{SQL: "RETURN $x", Vars: map[string]any{"x": 2}},
+		}
+		err := surrealdb.QueryRaw(ctx, s.db, &queries)
+		s.Require().Error(err)
+		s.Contains(err.Error(), "$x")
+	})
+
+	s.Run("shared variables with equal values", func() {
+		queries := []surrealdb.QueryStmt{
+			{SQL: "RETURN $x", Vars: map[string]any{"x": 1}},
+			{SQL: "RETURN $x + 1", Vars: map[string]any{"x": 1}},
+		}
+		s.Require().NoError(surrealdb.QueryRaw(ctx, s.db, &queries))
+	})
+}

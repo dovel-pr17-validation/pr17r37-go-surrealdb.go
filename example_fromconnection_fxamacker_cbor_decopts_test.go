@@ -1,0 +1,328 @@
+package surrealdb_test
+
+import (
+	"context"
+	"fmt"
+	"net/url"
+	"time"
+
+	"github.com/fxamacker/cbor/v2"
+	surrealdb "github.com/surrealdb/surrealdb.go/v2"
+	"github.com/surrealdb/surrealdb.go/v2/contrib/testenv"
+	"github.com/surrealdb/surrealdb.go/v2/pkg/connection"
+	"github.com/surrealdb/surrealdb.go/v2/pkg/connection/gorillaws"
+	"github.com/surrealdb/surrealdb.go/v2/pkg/connection/gws"
+	"github.com/surrealdb/surrealdb.go/v2/pkg/logger"
+	"github.com/surrealdb/surrealdb.go/v2/pkg/models"
+)
+
+// ExampleFromConnection_cborUnmarshaler_decOptions_defaultLimit demonstrates that the default
+// CBOR decoder configuration works fine with small arrays that are well within
+// the default limit of 131,072 elements.
+func ExampleFromConnection_cborUnmarshaler_decOptions_defaultLimit() {
+	// Parse the SurrealDB WebSocket URL
+	u, err := url.ParseRequestURI(testenv.GetSurrealDBWSURL())
+	if err != nil {
+		panic(fmt.Sprintf("Failed to parse URL: %v", err))
+	}
+
+	// Setup connection with default configuration
+	conf := connection.NewConfig(u)
+	conf.Logger = nil
+	conn := gorillaws.New(conf)
+
+	ctx, cancel := context.WithTimeout(context.Background(), setupTimeout)
+	defer cancel()
+
+	db, err := surrealdb.FromConnection(ctx, conn)
+	if err != nil {
+		panic(fmt.Sprintf("Failed to connect: %v", err))
+	}
+	defer db.Close(context.Background())
+
+	err = db.Use(ctx, "example", "test")
+	if err != nil {
+		panic(fmt.Sprintf("Failed to use namespace/database: %v", err))
+	}
+
+	_, err = db.SignIn(ctx, surrealdb.Auth{
+		Username: "root",
+		Password: "root",
+	})
+	if err != nil {
+		panic(fmt.Sprintf("SignIn failed: %v", err))
+	}
+
+	// USE before SignIn leaves the namespace/database uncreated since
+	// SurrealDB 3.x (surrealdb/surrealdb#239), so define them explicitly now
+	// that we are signed in as root.
+	if err = testenv.DefineNamespaceAndDatabase(db, "example", "test"); err != nil {
+		panic(fmt.Sprintf("Failed to define namespace/database: %v", err))
+	}
+
+	// Setup table and ensure it's clean before test
+	tableName := "test_default_limit"
+	setupTable(db, tableName)
+
+	// Default settings work with small arrays
+	createRecords(db, tableName, 10)
+	selectRecords(db, tableName)
+
+	// Output:
+	// Table test_default_limit cleaned up
+	// Successfully created record with 10 items
+	// Successfully retrieved record with 10 items
+}
+
+// ExampleFromConnection_cborUnmarshaler_decOptions_customSmallLimit demonstrates what happens
+// when a custom MaxArrayElements limit is set too low and the actual data
+// exceeds that limit. The unmarshal operation fails with a clear error message.
+func ExampleFromConnection_cborUnmarshaler_decOptions_customSmallLimit() {
+	// Parse the SurrealDB WebSocket URL
+	u, err := url.ParseRequestURI(testenv.GetSurrealDBWSURL())
+	if err != nil {
+		panic(fmt.Sprintf("Failed to parse URL: %v", err))
+	}
+
+	// First, create the record using default connection settings
+	{
+		conf := connection.NewConfig(u)
+		conf.Logger = nil
+		conn := gws.New(conf)
+
+		ctx, cancel := context.WithTimeout(context.Background(), setupTimeout)
+		defer cancel()
+
+		db, err := surrealdb.FromConnection(ctx, conn)
+		if err != nil {
+			panic(fmt.Sprintf("Failed to connect: %v", err))
+		}
+		defer db.Close(context.Background())
+
+		err = db.Use(ctx, "example", "test")
+		if err != nil {
+			panic(fmt.Sprintf("Failed to use namespace/database: %v", err))
+		}
+
+		_, err = db.SignIn(ctx, surrealdb.Auth{
+			Username: "root",
+			Password: "root",
+		})
+		if err != nil {
+			panic(fmt.Sprintf("SignIn failed: %v", err))
+		}
+
+		// USE before SignIn leaves the namespace/database uncreated since
+		// SurrealDB 3.x (surrealdb/surrealdb#239), so define them explicitly
+		// now that we are signed in as root.
+		if err = testenv.DefineNamespaceAndDatabase(db, "example", "test"); err != nil {
+			panic(fmt.Sprintf("Failed to define namespace/database: %v", err))
+		}
+
+		// Setup table and ensure it's clean before test
+		tableName := "test_small_limit"
+		setupTable(db, tableName)
+
+		createRecords(db, tableName, 20)
+	}
+
+	// Now try to retrieve with a connection that has a small array limit
+	{
+		conf := connection.NewConfig(u)
+		// Use TestLogHandler to see unmarshal errors but ignore debug and close errors
+		handler := testenv.NewTestLogHandlerWithOptions(
+			testenv.WithIgnoreErrorPrefixes("failed to close"),
+			testenv.WithIgnoreDebug(),
+		)
+		conf.Logger = logger.New(handler)
+		// Set a custom small limit that will be exceeded
+		// Note: fxamacker/cbor requires MaxArrayElements to be at least 16
+		conf.Unmarshaler = &models.CborUnmarshaler{ //nolint:staticcheck // Example demonstrating fxamacker/cbor DecOptions
+			DecOptions: cbor.DecOptions{
+				MaxArrayElements: 16, // Set to minimum allowed value
+			},
+		}
+		conn := gws.New(conf)
+
+		ctx, cancel := context.WithTimeout(context.Background(), setupTimeout)
+		defer cancel()
+
+		db, err := surrealdb.FromConnection(ctx, conn)
+		if err != nil {
+			panic(fmt.Sprintf("Failed to connect: %v", err))
+		}
+		defer db.Close(context.Background())
+
+		err = db.Use(ctx, "example", "test")
+		if err != nil {
+			panic(fmt.Sprintf("Failed to use namespace/database: %v", err))
+		}
+
+		_, err = db.SignIn(ctx, surrealdb.Auth{
+			Username: "root",
+			Password: "root",
+		})
+		if err != nil {
+			panic(fmt.Sprintf("SignIn failed: %v", err))
+		}
+
+		// This should fail due to array limit
+		tableName := "test_small_limit"
+		selectRecords(db, tableName)
+	}
+
+	// Output:
+	// Table test_small_limit cleaned up
+	// Successfully created record with 20 items
+	// [0] ERROR: Failed to unmarshal response error=cbor: exceeded max number of elements 16 for CBOR array
+	// Error retrieving record: context deadline exceeded
+}
+
+// ExampleCborUnmarshaler_DecOptions_customLargeLimit demonstrates how to
+// configure a custom MaxArrayElements limit that is higher than needed,
+// allowing successful retrieval of data that would fail with a smaller limit.
+func ExampleCborUnmarshaler_DecOptions_customLargeLimit() {
+	// Parse the SurrealDB WebSocket URL
+	u, err := url.ParseRequestURI(testenv.GetSurrealDBWSURL())
+	if err != nil {
+		panic(fmt.Sprintf("Failed to parse URL: %v", err))
+	}
+
+	// Setup connection with custom CBOR unmarshaler that has a larger limit
+	conf := connection.NewConfig(u)
+	conf.Logger = nil
+	// Set a custom larger limit that accommodates the data
+	conf.Unmarshaler = &models.CborUnmarshaler{ //nolint:staticcheck // Example demonstrating fxamacker/cbor DecOptions
+		DecOptions: cbor.DecOptions{
+			// Note that the default value is 131072.
+			// We use smaller value just to make test run quickly.
+			MaxArrayElements: 100,
+		},
+	}
+	conn := gorillaws.New(conf)
+
+	ctx, cancel := context.WithTimeout(context.Background(), setupTimeout)
+	defer cancel()
+
+	db, err := surrealdb.FromConnection(ctx, conn)
+	if err != nil {
+		panic(fmt.Sprintf("Failed to connect: %v", err))
+	}
+	defer db.Close(context.Background())
+
+	err = db.Use(ctx, "example", "test")
+	if err != nil {
+		panic(fmt.Sprintf("Failed to use namespace/database: %v", err))
+	}
+
+	_, err = db.SignIn(ctx, surrealdb.Auth{
+		Username: "root",
+		Password: "root",
+	})
+	if err != nil {
+		panic(fmt.Sprintf("SignIn failed: %v", err))
+	}
+
+	// USE before SignIn leaves the namespace/database uncreated since
+	// SurrealDB 3.x (surrealdb/surrealdb#239), so define them explicitly now
+	// that we are signed in as root.
+	if err = testenv.DefineNamespaceAndDatabase(db, "example", "test"); err != nil {
+		panic(fmt.Sprintf("Failed to define namespace/database: %v", err))
+	}
+
+	// Setup table and ensure it's clean before test
+	tableName := "test_large_limit"
+	setupTable(db, tableName)
+
+	createRecords(db, tableName, 20)
+
+	// This should work with the larger limit
+	selectRecords(db, tableName)
+
+	// Output:
+	// Table test_large_limit cleaned up
+	// Successfully created record with 20 items
+	// Successfully retrieved record with 20 items
+}
+
+// Timeouts used across the examples in this file.
+//
+// These are deliberately generous so that the examples do not flake on slow CI
+// runners where the initial WebSocket handshake, Use, SignIn and query round
+// trips can easily take longer than a second combined. They should still be
+// short enough to keep the example test suite fast in the happy path, since a
+// successful query resolves in milliseconds regardless of the upper bound.
+const (
+	// setupTimeout is shared across FromConnection + Use + SignIn in each example.
+	setupTimeout = 10 * time.Second
+	// queryTimeout bounds individual helper queries (DELETE/CREATE/SELECT).
+	//
+	// It must also be long enough to cover the intentionally-hung SELECT in
+	// ExampleFromConnection_cborUnmarshaler_decOptions_customSmallLimit where
+	// the unmarshaler rejects the response and the request is drained via
+	// context cancellation — so making this huge directly increases the wall
+	// time of that example.
+	queryTimeout = 5 * time.Second
+)
+
+// setupTable prepares a clean table for testing by deleting any existing records
+func setupTable(db *surrealdb.DB, tableName string) {
+	ctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
+	defer cancel()
+
+	// Clean up the table
+	_, _ = surrealdb.Query[any](ctx, db, fmt.Sprintf("DELETE %s", tableName), nil)
+	fmt.Printf("Table %s cleaned up\n", tableName)
+}
+
+// createRecords creates a test record in the specified table
+func createRecords(db *surrealdb.DB, tableName string, arraySize int) {
+	ctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
+	defer cancel()
+
+	// Create array with specified number of elements
+	items := make([]string, arraySize)
+	for i := range arraySize {
+		items[i] = fmt.Sprintf("item_%d", i)
+	}
+
+	// Create the record
+	_, err := surrealdb.Query[any](ctx, db, fmt.Sprintf("CREATE %s SET items = $items", tableName), map[string]any{
+		"items": items,
+	})
+
+	if err != nil {
+		fmt.Printf("Error creating record: %v\n", err)
+	} else {
+		fmt.Printf("Successfully created record with %d items\n", arraySize)
+	}
+}
+
+func selectRecords(db *surrealdb.DB, tableName string) {
+	ctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
+	defer cancel()
+
+	// Create test data structure
+	type TestRecord struct {
+		ID    any      `json:"id"`
+		Items []string `json:"items"`
+	}
+
+	// Try to retrieve the record
+	// This is where the MaxArrayElements limit will be enforced during decoding
+	result, err := surrealdb.Query[[]TestRecord](ctx, db, fmt.Sprintf("SELECT * FROM %s", tableName), nil)
+
+	if err != nil {
+		// Log the error directly - it will be verified in the expected output
+		fmt.Printf("Error retrieving record: %v\n", err)
+		return
+	}
+
+	// Check if we got results
+	if result != nil && len(*result) > 0 && len((*result)[0].Result) > 0 {
+		recordCount := len((*result)[0].Result)
+		if recordCount > 0 && (*result)[0].Result[0].Items != nil {
+			fmt.Printf("Successfully retrieved record with %d items\n", len((*result)[0].Result[0].Items))
+		}
+	}
+}
